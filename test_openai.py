@@ -29,6 +29,34 @@ def test_openai_api():
         print("请求失败:", str(e))
         print()
     
+    # 多模态请求（图片上传） - OpenAI标准格式
+    request_data = {
+        "model": "hunyuan",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "这张图片是什么？"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}}
+                ]
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(
+            "http://127.0.0.1:8000/v1/chat/completions",
+            json=request_data,
+            headers={"Content-Type": "application/json"}
+        )
+        print("=== 多模态请求（图片上传） ===")
+        print("状态码:", response.status_code)
+        print("响应:", json.dumps(response.json(), indent=2, ensure_ascii=False))
+        print()
+    except Exception as e:
+        print("请求失败:", str(e))
+        print()
+    
     # 多轮对话请求
     request_data = {
         "model": "hunyuan",

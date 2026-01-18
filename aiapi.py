@@ -781,14 +781,38 @@ def messages_to_text(messages):
         role = msg.get('role', 'user')
         content = msg.get('content', '')
         
-        if role == 'system':
-            text_parts.append(f"系统指令: {content}")
-        elif role == 'assistant':
-            text_parts.append(f"助手: {content}")
-        elif role == 'user':
-            text_parts.append(f"用户: {content}")
+        if isinstance(content, str):
+            if role == 'system':
+                text_parts.append(f"系统指令: {content}")
+            elif role == 'assistant':
+                text_parts.append(f"助手: {content}")
+            elif role == 'user':
+                text_parts.append(f"用户: {content}")
+        elif isinstance(content, list):
+            for item in content:
+                if item.get('type') == 'text':
+                    text_content = item.get('text', '')
+                    if role == 'system':
+                        text_parts.append(f"系统指令: {text_content}")
+                    elif role == 'assistant':
+                        text_parts.append(f"助手: {text_content}")
+                    elif role == 'user':
+                        text_parts.append(f"用户: {text_content}")
     
     return '\n'.join(text_parts)
+
+def extract_images_from_messages(messages):
+    """从OpenAI messages中提取图片URL"""
+    images = []
+    for msg in messages:
+        content = msg.get('content', '')
+        if isinstance(content, list):
+            for item in content:
+                if item.get('type') == 'image_url':
+                    url = item.get('image_url', {}).get('url', '')
+                    if url:
+                        images.append(url)
+    return images
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def openai_chat_completions():
@@ -833,14 +857,12 @@ def openai_chat_completions():
         messages = request_data.get('messages', [])
         model = request_data.get('model', 'hunyuan')
         stream = request_data.get('stream', False)
-        session_id = request_data.get('sequence', 'new')
-        
-        picture = request_data.get('picture')
         
         logging.info(f"标签页 {tab.tab_id}: 处理OpenAI请求, 模型={model}, 流式={stream}, 消息数={len(messages)}")
         
         text = messages_to_text(messages)
-        if not text:
+        images = extract_images_from_messages(messages)
+        if not text and not images:
             return jsonify({
                 "error": {
                     "message": "消息内容不能为空",
@@ -848,6 +870,8 @@ def openai_chat_completions():
                     "code": "invalid_request_error"
                 }
             }), 400
+        
+        session_id = "new"
         
         if not tab.handle_session(session_id):
             return jsonify({
@@ -867,24 +891,12 @@ def openai_chat_completions():
             if not tab.change_model(model):
                 logging.warning(f"标签页 {tab.tab_id}: 模型切换失败，使用默认模型")
         
-        if picture and picture != "new":
+        for image in images:
             logging.info(f"标签页 {tab.tab_id}: 上传图片")
-            if not tab.upload_image(picture):
+            if not tab.upload_image(image):
                 return jsonify({
                     "error": {
                         "message": "图片上传失败",
-                        "type": "server_error",
-                        "code": "server_error"
-                    }
-                }), 500
-        
-        files = {k: v for k, v in request_data.items() if re.match(r'file\d+', k)}
-        if files:
-            logging.info(f"标签页 {tab.tab_id}: 上传 {len(files)} 个文件")
-            if not tab.upload_files(files, request_data):
-                return jsonify({
-                    "error": {
-                        "message": "文件上传失败",
                         "type": "server_error",
                         "code": "server_error"
                     }
@@ -1042,11 +1054,8 @@ def handle_request():
         session_id = request_data.get('sequence', 'new')
         model = request_data.get('mode', 'hunyuan')
         text = request_data.get('text', '')
-        picture = request_data.get('picture')
         
-        files = {k: v for k, v in request_data.items() if re.match(r'file\d+', k)}
-        
-        if not text and not picture and not files:
+        if not text:
             return jsonify({
                 "error": {
                     "message": "消息内容不能为空",
@@ -1072,28 +1081,6 @@ def handle_request():
             logging.info(f"标签页 {tab.tab_id}: 切换模型到 {model}")
             if not tab.change_model(model):
                 logging.warning(f"标签页 {tab.tab_id}: 模型切换失败，使用默认模型")
-        
-        if picture and picture != "new":
-            logging.info(f"标签页 {tab.tab_id}: 上传图片")
-            if not tab.upload_image(picture):
-                return jsonify({
-                    "error": {
-                        "message": "图片上传失败",
-                        "type": "server_error",
-                        "code": "server_error"
-                    }
-                }), 500
-        
-        if files:
-            logging.info(f"标签页 {tab.tab_id}: 上传 {len(files)} 个文件")
-            if not tab.upload_files(files, request_data):
-                return jsonify({
-                    "error": {
-                        "message": "文件上传失败",
-                        "type": "server_error",
-                        "code": "server_error"
-                    }
-                }), 500
         
         internal_request_data = {"text": text}
         response = tab.send_message(internal_request_data)
@@ -1145,108 +1132,6 @@ def handle_request():
                 "code": "server_error"
             }
         }), 500
-    finally:
-        tab.lock.release()
-        logging.info(f"标签页 {tab.tab_id}: 释放锁")
-    logging.info("收到新请求")
-    
-    # 获取可用标签页
-    tab = get_available_tab()
-    if not tab:
-        logging.warning("系统繁忙，所有标签页都忙")
-        return jsonify({"error": "系统繁忙，请稍后再试"}), 429
-    
-    # 尝试获取标签页锁
-    if not tab.lock.acquire(blocking=False):
-        logging.warning(f"标签页 {tab.tab_id} 忙，尝试获取其他标签页")
-        # 如果获取的标签页突然变忙，尝试获取其他标签页
-        tab = get_available_tab()
-        if not tab or not tab.lock.acquire(blocking=False):
-            logging.warning("系统繁忙，无法获取可用标签页")
-            return jsonify({"error": "系统繁忙，请稍后再试"}), 429
-    
-    try:
-        # 安全解析JSON数据
-        try:
-            # 尝试直接获取JSON
-            request_data = request.get_json()
-            if request_data is None:
-                # 如果get_json返回None，尝试手动解析
-                data = request.data.decode('utf-8')
-                if not data:
-                    logging.warning("空请求体")
-                    return jsonify({"error": "请求数据为空"}), 400
-                request_data = json.loads(data)
-        except Exception as e:
-            logging.warning(f"JSON解析失败: {str(e)}")
-            # 尝试手动解析
-            data = request.data.decode('utf-8')
-            if not data:
-                logging.warning("空请求体")
-                return jsonify({"error": "请求数据为空"}), 400
-            try:
-                request_data = json.loads(data)
-            except:
-                logging.warning("无效的JSON格式")
-                return jsonify({"error": "无效的JSON格式"}), 400
-        
-        # 确保request_data是字典类型
-        if not isinstance(request_data, dict):
-            logging.warning(f"请求数据不是字典类型: {type(request_data)}")
-            # 尝试转换或提取
-            if isinstance(request_data, str):
-                try:
-                    request_data = json.loads(request_data)
-                except:
-                    logging.warning("无法将字符串转换为字典")
-                    request_data = {"text": request_data}
-            else:
-                request_data = {"text": str(request_data)}
-        
-        logging.info(f"标签页 {tab.tab_id}: 处理请求: {json.dumps(request_data, ensure_ascii=False)[:200]}...")
-        session_id = request_data.get('sequence', 'new')
-        
-        # 处理会话
-        if not tab.handle_session(session_id):
-            return jsonify({"error": "会话操作失败"}), 500
-        
-        # 切换模型
-        mode = request_data.get('mode')
-        if mode:
-            logging.info(f"标签页 {tab.tab_id}: 切换模型到 {mode}")
-            if not tab.change_model(mode):
-                return jsonify({"error": "模型切换失败"}), 500
-        
-        # 上传图片
-        picture = request_data.get('picture')
-        if picture and picture != "new":
-            logging.info(f"标签页 {tab.tab_id}: 上传图片")
-            if not tab.upload_image(picture):
-                return jsonify({"error": "图片上传失败"}), 500
-        
-        # 上传文件
-        files = {}
-        if isinstance(request_data, dict):
-            files = {k: v for k, v in request_data.items() if re.match(r'file\d+', k)}
-        elif hasattr(request_data, 'items'):
-            files = {k: v for k, v in request_data.items() if re.match(r'file\d+', k)}
-        
-        if files:
-            logging.info(f"标签页 {tab.tab_id}: 上传 {len(files)} 个文件")
-            if not tab.upload_files(files, request_data):
-                return jsonify({"error": "文件上传失败"}), 500
-        
-        # 发送消息并获取响应
-        response = tab.send_message(request_data)
-        logging.info(f"标签页 {tab.tab_id}: 请求处理完成: ID={response.get('id')}, 文本长度={len(response.get('text', ''))}")
-        return jsonify(response)
-        
-    except TimeoutError as e:
-        logging.error(f"标签页 {tab.tab_id}: 操作超时: {str(e)}")
-        return jsonify({"error": str(e)}), 504
-    except Exception as e:
-        logging.exception(f"标签页 {tab.tab_id}: 处理出错: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({"error": f"服务器错误: {str(e)}"}), 500
     finally:
         tab.lock.release()
         logging.info(f"标签页 {tab.tab_id}: 释放锁")

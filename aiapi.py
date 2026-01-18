@@ -771,8 +771,383 @@ def get_available_tab():
         logging.warning(f"所有标签页都忙且达到最大数量 {MAX_TABS}")
         return None
 
+def messages_to_text(messages):
+    """将OpenAI messages格式转换为简单文本"""
+    if not messages:
+        return ""
+    
+    text_parts = []
+    for msg in messages:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+        
+        if role == 'system':
+            text_parts.append(f"系统指令: {content}")
+        elif role == 'assistant':
+            text_parts.append(f"助手: {content}")
+        elif role == 'user':
+            text_parts.append(f"用户: {content}")
+    
+    return '\n'.join(text_parts)
+
+@app.route('/v1/chat/completions', methods=['POST'])
+def openai_chat_completions():
+    """OpenAI API格式兼容端点"""
+    logging.info("收到OpenAI格式请求")
+    
+    tab = get_available_tab()
+    if not tab:
+        logging.warning("系统繁忙，所有标签页都忙")
+        return jsonify({
+            "error": {
+                "message": "系统繁忙，请稍后再试",
+                "type": "server_error",
+                "code": "server_error"
+            }
+        }), 503
+    
+    if not tab.lock.acquire(blocking=False):
+        logging.warning(f"标签页 {tab.tab_id} 忙")
+        tab = get_available_tab()
+        if not tab or not tab.lock.acquire(blocking=False):
+            logging.warning("系统繁忙，无法获取可用标签页")
+            return jsonify({
+                "error": {
+                    "message": "系统繁忙，请稍后再试",
+                    "type": "server_error",
+                    "code": "server_error"
+                }
+            }), 503
+    
+    try:
+        request_data = request.get_json()
+        if request_data is None:
+            return jsonify({
+                "error": {
+                    "message": "请求数据为空",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error"
+                }
+            }), 400
+        
+        messages = request_data.get('messages', [])
+        model = request_data.get('model', 'hunyuan')
+        stream = request_data.get('stream', False)
+        session_id = request_data.get('sequence', 'new')
+        
+        picture = request_data.get('picture')
+        
+        logging.info(f"标签页 {tab.tab_id}: 处理OpenAI请求, 模型={model}, 流式={stream}, 消息数={len(messages)}")
+        
+        text = messages_to_text(messages)
+        if not text:
+            return jsonify({
+                "error": {
+                    "message": "消息内容不能为空",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error"
+                }
+            }), 400
+        
+        if not tab.handle_session(session_id):
+            return jsonify({
+                "error": {
+                    "message": "会话操作失败",
+                    "type": "server_error",
+                    "code": "server_error"
+                }
+            }), 500
+        
+        if model and model not in ["hunyuan", "deepseek"]:
+            logging.warning(f"标签页 {tab.tab_id}: 不支持的模型 {model}, 使用默认模型")
+            model = "hunyuan"
+        
+        if model:
+            logging.info(f"标签页 {tab.tab_id}: 切换模型到 {model}")
+            if not tab.change_model(model):
+                logging.warning(f"标签页 {tab.tab_id}: 模型切换失败，使用默认模型")
+        
+        if picture and picture != "new":
+            logging.info(f"标签页 {tab.tab_id}: 上传图片")
+            if not tab.upload_image(picture):
+                return jsonify({
+                    "error": {
+                        "message": "图片上传失败",
+                        "type": "server_error",
+                        "code": "server_error"
+                    }
+                }), 500
+        
+        files = {k: v for k, v in request_data.items() if re.match(r'file\d+', k)}
+        if files:
+            logging.info(f"标签页 {tab.tab_id}: 上传 {len(files)} 个文件")
+            if not tab.upload_files(files, request_data):
+                return jsonify({
+                    "error": {
+                        "message": "文件上传失败",
+                        "type": "server_error",
+                        "code": "server_error"
+                    }
+                }), 500
+        
+        internal_request_data = {"text": text}
+        response = tab.send_message(internal_request_data)
+        
+        response_text = response.get('text', '')
+        session_id = response.get('id', 'new')
+        
+        logging.info(f"标签页 {tab.tab_id}: OpenAI请求处理完成: ID={session_id}, 文本长度={len(response_text)}")
+        
+        openai_response = {
+            "id": f"chatcmpl-{session_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(text),
+                "completion_tokens": len(response_text),
+                "total_tokens": len(text) + len(response_text)
+            }
+        }
+        
+        return jsonify(openai_response)
+        
+    except TimeoutError as e:
+        logging.error(f"标签页 {tab.tab_id}: 操作超时: {str(e)}")
+        return jsonify({
+            "error": {
+                "message": str(e),
+                "type": "timeout_error",
+                "code": "timeout"
+            }
+        }), 504
+    except Exception as e:
+        logging.exception(f"标签页 {tab.tab_id}: 处理出错: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({
+            "error": {
+                "message": f"服务器错误: {str(e)}",
+                "type": "server_error",
+                "code": "server_error"
+            }
+        }), 500
+    finally:
+        tab.lock.release()
+        logging.info(f"标签页 {tab.tab_id}: 释放锁")
+
+@app.route('/v1/models', methods=['GET'])
+def list_models():
+    """列出可用模型"""
+    return jsonify({
+        "object": "list",
+        "data": [
+            {
+                "id": "hunyuan",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "tencent"
+            },
+            {
+                "id": "deepseek",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "tencent"
+            }
+        ]
+    })
+
 @app.route('/hunyuan', methods=['POST'])
 def handle_request():
+    logging.info("收到原有格式请求，转换为OpenAI格式")
+    
+    tab = get_available_tab()
+    if not tab:
+        logging.warning("系统繁忙，所有标签页都忙")
+        return jsonify({
+            "error": {
+                "message": "系统繁忙，请稍后再试",
+                "type": "server_error",
+                "code": "server_error"
+            }
+        }), 503
+    
+    if not tab.lock.acquire(blocking=False):
+        logging.warning(f"标签页 {tab.tab_id} 忙，尝试获取其他标签页")
+        tab = get_available_tab()
+        if not tab or not tab.lock.acquire(blocking=False):
+            logging.warning("系统繁忙，无法获取可用标签页")
+            return jsonify({
+                "error": {
+                    "message": "系统繁忙，请稍后再试",
+                    "type": "server_error",
+                    "code": "server_error"
+                }
+            }), 503
+    
+    try:
+        try:
+            request_data = request.get_json()
+            if request_data is None:
+                data = request.data.decode('utf-8')
+                if not data:
+                    return jsonify({
+                        "error": {
+                            "message": "请求数据为空",
+                            "type": "invalid_request_error",
+                            "code": "invalid_request_error"
+                        }
+                    }), 400
+                request_data = json.loads(data)
+        except Exception as e:
+            data = request.data.decode('utf-8')
+            if not data:
+                return jsonify({
+                    "error": {
+                        "message": "请求数据为空",
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error"
+                    }
+                }), 400
+            try:
+                request_data = json.loads(data)
+            except:
+                return jsonify({
+                    "error": {
+                        "message": "无效的JSON格式",
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error"
+                    }
+                }), 400
+        
+        if not isinstance(request_data, dict):
+            if isinstance(request_data, str):
+                try:
+                    request_data = json.loads(request_data)
+                except:
+                    request_data = {"text": request_data}
+            else:
+                request_data = {"text": str(request_data)}
+        
+        logging.info(f"标签页 {tab.tab_id}: 处理请求: {json.dumps(request_data, ensure_ascii=False)[:200]}...")
+        
+        session_id = request_data.get('sequence', 'new')
+        model = request_data.get('mode', 'hunyuan')
+        text = request_data.get('text', '')
+        picture = request_data.get('picture')
+        
+        files = {k: v for k, v in request_data.items() if re.match(r'file\d+', k)}
+        
+        if not text and not picture and not files:
+            return jsonify({
+                "error": {
+                    "message": "消息内容不能为空",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error"
+                }
+            }), 400
+        
+        if not tab.handle_session(session_id):
+            return jsonify({
+                "error": {
+                    "message": "会话操作失败",
+                    "type": "server_error",
+                    "code": "server_error"
+                }
+            }), 500
+        
+        if model and model not in ["hunyuan", "deepseek"]:
+            logging.warning(f"标签页 {tab.tab_id}: 不支持的模型 {model}, 使用默认模型")
+            model = "hunyuan"
+        
+        if model:
+            logging.info(f"标签页 {tab.tab_id}: 切换模型到 {model}")
+            if not tab.change_model(model):
+                logging.warning(f"标签页 {tab.tab_id}: 模型切换失败，使用默认模型")
+        
+        if picture and picture != "new":
+            logging.info(f"标签页 {tab.tab_id}: 上传图片")
+            if not tab.upload_image(picture):
+                return jsonify({
+                    "error": {
+                        "message": "图片上传失败",
+                        "type": "server_error",
+                        "code": "server_error"
+                    }
+                }), 500
+        
+        if files:
+            logging.info(f"标签页 {tab.tab_id}: 上传 {len(files)} 个文件")
+            if not tab.upload_files(files, request_data):
+                return jsonify({
+                    "error": {
+                        "message": "文件上传失败",
+                        "type": "server_error",
+                        "code": "server_error"
+                    }
+                }), 500
+        
+        internal_request_data = {"text": text}
+        response = tab.send_message(internal_request_data)
+        
+        response_text = response.get('text', '')
+        session_id = response.get('id', 'new')
+        
+        logging.info(f"标签页 {tab.tab_id}: 请求处理完成: ID={session_id}, 文本长度={len(response_text)}")
+        
+        openai_response = {
+            "id": f"chatcmpl-{session_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(text),
+                "completion_tokens": len(response_text),
+                "total_tokens": len(text) + len(response_text)
+            }
+        }
+        
+        return jsonify(openai_response)
+        
+    except TimeoutError as e:
+        logging.error(f"标签页 {tab.tab_id}: 操作超时: {str(e)}")
+        return jsonify({
+            "error": {
+                "message": str(e),
+                "type": "timeout_error",
+                "code": "timeout"
+            }
+        }), 504
+    except Exception as e:
+        logging.exception(f"标签页 {tab.tab_id}: 处理出错: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({
+            "error": {
+                "message": f"服务器错误: {str(e)}",
+                "type": "server_error",
+                "code": "server_error"
+            }
+        }), 500
+    finally:
+        tab.lock.release()
+        logging.info(f"标签页 {tab.tab_id}: 释放锁")
     logging.info("收到新请求")
     
     # 获取可用标签页
